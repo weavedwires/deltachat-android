@@ -1,76 +1,103 @@
 # Глобальный план: перевод UI на батчевые RPC + оптимизация БД в ядре
 
 > Ветка: `feat/rpc-batch-migration`. Форк: `weavedwires/deltachat-android`.
-> Это дорожная карта из трёх направлений. Детальный план сообщений — в `rpc-batch-messages.md`.
+> Детальные планы: чаты — `rpc-batch-chatlist.md`, сообщения — `rpc-batch-messages.md`.
 
-## Контекст (зачем всё это)
+## TL;DR
 
-Delta Chat Android общается с Rust-ядром двумя путями, оба в одном нативном модуле:
-
-- **Прямой C-ABI** (`DcContext` → `dc_get_msg`/`dc_get_chatlist`/`dc_chatlist_get_summary`) —
-  синхронные указатели, загрузка по одному. Основной путь UI сегодня.
-- **JSON-RPC** (`Rpc`/`FFITransport` → `dc_jsonrpc_*` → `CommandApi`) — DTO, батчи.
-
-RPC вводился (PR #2479) как путь «не писать новый CFFI под каждую фичу», а не как
-замена UI; миграция идёт точечно (location #4400, relay #4637, transports #4657).
-
-**Ключевой вывод ресёрча:** узкое место — БД (SQL), а не копирование в памяти.
-`getMsg`/`getSummary` = SELECT на каждую строку на main-потоке. Нативные указатели
-(`dc_msg_t` = `Box`) — это lifetime C ABI, а не «оптимизация памяти»; оптимизацию
-SELECT'ов в коде делает только `recordCache` (SoftReference).
-
-Батчевые RPC-методы **уже есть в ядре**, но под капотом пока цикл SELECT — батч
-срезает round-trip/JNI/main-блокировки, но не число SQL-запросов.
+Рендер списков чатов и сообщений сейчас делает вызовы Rust-ядра прямо из main-потока,
+и каждый такой вызов оборачивается SELECT-запросом к SQLite — по несколько запросов на
+строку. Это даёт jank при прокрутке и риск ANR. В ядре уже есть батчевые JSON-RPC методы,
+возвращающие готовые объекты пачкой, но клиент их не использует. План — перевести рендер
+на эти методы (загрузка в фоне), а отдельно — научить ядро отдавать пачку одним SQL-запросом.
 
 ---
 
-## 1. Сообщения (рендер списка чата)
+## Архитектура и терминология (читать первым)
+
+Delta Chat Android — почтовый мессенджер. Вся логика (хранение, шифрование, сеть) лежит
+в Rust-ядре `chatmail/core`, которое работает **in-process** через JNI и хранит данные в
+SQLite. Android-клиент — тонкий UI на Java (кодовая база унаследована от Signal).
+
+### Два способа общения UI с ядром
+
+1. **Прямой C-ABI (FFI).** Классы-обёртки `DcContext`, `DcMsg`, `DcChat`, `DcChatlist`,
+   `DcLot` держат `long`-указатель на Rust-объект и вызывают нативные методы через JNI.
+   Каждый вызов = переход JNI → Rust и, как правило, SELECT в SQLite. Объекты создаются
+   по одному: `dc_get_msg`, `dc_get_chat`, `dc_chatlist_get_summary` и т.д. Это основной
+   путь UI сегодня.
+2. **JSON-RPC.** Автогенерированный клиент `Rpc` шлёт JSON-запросы в ядро
+   (`deltachat_jsonrpc::CommandApi`) и получает **плоские объекты** (DTO из пакета
+   `chat.delta.rpc.types.*`). Есть батчевые методы: передаёшь список id — получаешь
+   список готовых объектов одним вызовом.
+
+### Термины
+
+- **FFI / C ABI** — Foreign Function Interface: прямой вызов нативных функций через JNI.
+- **Нативная обёртка / CPtr** — Java-класс с `long`-полем, ссылающимся на Rust-объект
+  в куче (`DcMsg`, `DcChat`, `DcChatlist`, `DcLot`). Живёт, пока жив Java-объект (через
+  `finalize`/`unref`).
+- **DTO** — плоский data-объект (только поля, без логики), сериализуется в JSON. Примеры:
+  `ChatListItem`, `MessageLoadResult`.
+- **virtual list** — паттерн: список id грузится одним запросом, а данные — только для
+  видимых элементов по мере прокрутки.
+- **main / UI-поток** — главный поток Android. Блокировка дольше ~16 мс = пропущенный кадр
+  (jank); дольше ~5 с = ANR («приложение не отвечает»).
+- **SELECT** — SQL-запрос к SQLite. В этом контексте — самая дорогая операция.
+
+### Проблема (одним абзацем)
+
+UI рендерит списки, вызывая нативные методы прямо из main-потока. Под капотом эти вызовы
+делают SELECT в SQLite — по несколько запросов на каждую строку. При прокрутке это даёт
+jank и потенциальные ANR. Батчевые RPC-методы в ядре уже существуют, но клиент их не
+использует.
+
+### Ключевой вывод (подтверждён чтением исходников ядра)
+
+Узкое место — БД (SQL), а не копирование в памяти и не сериализация JSON. Нативные
+указатели — это механизм времени жизни C ABI, а не «оптимизация памяти»; единственная
+оптимизация SELECT'ов в клиенте сегодня — `recordCache` (SoftReference). При этом батчевые
+методы ядра сейчас внутри — **цикл** SELECT'ов, а не один `WHERE id IN (…)`: они срезают
+round-trip/JNI/блокировки main, но не число SQL-запросов. Поэтому план разбит на
+транспортный слой (п.1–2, клиент) и слой БД (п.3, ядро).
+
+---
+
+## Направление 1 — Чаты (список чатов)
+
+**Что:** перевести рендер списка чатов на батч `getChatlistItemsByEntries`.
+
+**Проблема:** `ConversationListAdapter.onBindViewHolder` на main делает
+`dcContext.getChat(chatId)` + `dcChatlist.getSummary(i, chat)` + `getFreshMsgCount(chatId)`
+= 3–5 SELECT на строку, без кеша.
+
+**Решение:** получить список id (`getChatlistEntries`), затем батчем DTO
+(`getChatlistItemsByEntries`). DTO `ChatListItem` покрывает рендер полностью (имя, аватар,
+счётчик непрочитанных, статус, дату, флаги).
+
+**Порядок:** делать **первым** — зона локализована, риск низкий.
+
+**Подробно:** `rpc-batch-chatlist.md`.
+
+---
+
+## Направление 2 — Сообщения (рендер открытого чата)
 
 **Что:** перевести рендер списка сообщений с `DcMsg` на батчевый DTO, оставив virtual list.
 
-**Схема:** `getChatMsgs` → id (не меняем) → кеш DTO `Map<Integer, MessageLoadResult>`
-→ `getItemViewType`/`bind` читают DTO → prefetch окна через `getMessages(ids)` в фоне
-→ действия по id, композер на `DcMsg`.
+**Схема:** `getChatMsgs` → id (не меняем) → кеш DTO `Map<Integer, MessageLoadResult>` →
+`getItemViewType`/`bind` читают DTO → prefetch окна через `getMessages(ids)` в фоне →
+действия по id, композер на `DcMsg`.
 
-**Граница (проверено):** рендер = DTO, действия = id (`deleteMessages`/`markseenMsgs`/
-`sendReaction`), композер = DcMsg (`SendRelayedMessageUtil`/`ConversationActivity`/
-`VideoRecodeManager`/`AttachmentManager`), reply = `quotedMessageId`.
+**Граница (подтверждено кодом):** рендер = DTO; действия над существующими сообщениями =
+id (`deleteMessages`/`markseenMsgs`/`sendReaction`); композер (создание/отправка) = `DcMsg`;
+reply = `quotedMessageId`.
 
 **Подробно:** `rpc-batch-messages.md`.
 
 ---
 
-## 2. Чаты (список чатов)
-
-**Что:** перевести рендер списка чатов на батч `getChatlistItemsByEntries`.
-
-**Проблема:** `ConversationListAdapter.onBindViewHolder` на main делает
-`dcContext.getChat(chatId)` + `dcChatlist.getSummary(i, chat)` = 2–4 SELECT на строку,
-без кеша. `DcChatlist.getSummary(index)` в legacy FFI — по одному, `DcLot` с поштучными
-`getText1/2/getTimestamp/getState` (сами геттеры — 0 SQL, но `getSummary` грузит lastmsg
-+ contact + reactions).
-
-**Решение:** `getChatlist` (id) → `getChatlistItemsByEntries(accountId, List<Integer> entries)`
-→ `Map<String, ChatListItemFetchResult>`. DTO `ChatListItem` полный: `name`, `summaryText1/2`,
-`timestamp`, `avatarPath`, `freshMessageCounter`, `isMuted`, `isPinned`, `lastMessageId` и т.д.
-Метод уже есть (`Rpc.java:482`).
-
-**Зона (локализована):** `ConversationListAdapter`, `ConversationListItem`/`InboxZero`,
-`ThreadRecord`, `DcHelper.getThreadRecord`, `SearchResult`/`SearchListAdapter`, `ProfileAdapter`.
-
-**Подводный камень:** `DcLot` имеет двойное назначение — это и summary списка чатов,
-и результат `checkQr()` (QR/прокси/онбординг/поиск). Заменять только в пути рендера
-списка, **не** трогая QR-путь (`checkQr` → `ProxySettingsActivity`, `InstantOnboardingActivity`,
-`RegistrationQrActivity`, `QrInviteData`).
-
-**Порядок:** делать **первым** — зона проще и безопаснее, батч-метод полный.
-
-**Подробно:** `rpc-batch-chatlist.md` (зависимости от указателей, покрытие DTO, методы,
-как сократить 3–5 SELECT в один, подводные камни, план по файлам).
-
----
-
-## 3. БД в ядре (batch-SELECT)
+## Направление 3 — БД в ядре (batch-SELECT)
 
 **Что:** научить ядро отдавать пачку сообщений/чатов одним SQL-запросом, а не циклом.
 
@@ -81,19 +108,20 @@ for message_id in message_ids {
     // → Message::load_from_db → SELECT … WHERE m.id=? (по одному)
 }
 ```
-
 Плюс `load_from_db` тащит `LEFT JOIN chats` + `LEFT JOIN msgs_mdns` на каждое сообщение
 (`src/message.rs:488`).
 
 **Решение:**
 1. `SELECT … WHERE m.id IN (…ids…)` одним запросом вместо цикла `load_from_db`.
-2. Вынести `LEFT JOIN chats`/`msgs_mdns` из per-message в общий (или подзапрос/пакетизация),
+2. Вынести `LEFT JOIN chats`/`msgs_mdns` из per-message в общий запрос (или подзапрос),
    чтобы джойны не повторялись N раз.
-3. Аналогично для `get_chatlist_items_by_entries` (сейчас `get_summary` на каждый entry —
-   см. `chatlist.rs get_summary2`: lastmsg + contact + reactions).
+3. Аналогично для `get_chatlist_items_by_entries` — сейчас `get_chat_list_item_by_id`
+   делает ~9–11 SELECT на чат (fresh_msg_cnt, last_message, load_from_db, get_summary2,
+   profile_image, повторный load lastmsg, chat_contacts, contact, color, encrypted,
+   self_in_chat) с дублями.
 
 **Эффект:** батч начнёт резать не только транспорт, но и число SQL — это и есть главный
-тезис «оптимизировать БД, а не копирование».
+тезис «оптимизировать БД, а не копирование в памяти».
 
 **Ограничение:** это форк `chatmail/core` + пересборка натива через NDK. Отдельная история,
 не в этой ветке Android-клиента (если только не подтягивать submodule).
@@ -112,4 +140,4 @@ for message_id in message_ids {
 
 - В этой среде нет Android SDK/NDK — сборку и проверку APK выполняет заказчик
   (IntelliJ/Android Studio). Изменения пишутся минимальными локальными шагами.
-- Правки ядра (п.3) требуют Rust toolchain + NDK и живут в `chatmail/core`, не здесь.
+- Правки ядра (направление 3) требуют Rust toolchain + NDK и живут в `chatmail/core`, не здесь.

@@ -1,12 +1,24 @@
 # Перевод списка чатов на батчевый RPC (`getChatlistItemsByEntries`)
 
-> Статус: план, этап 1 глобального `rpc-batch-roadmap.md` (делается первым — зона проще).
+> Часть глобального плана — см. `rpc-batch-roadmap.md` (там архитектура, термины, порядок).
+> Это направление 1: делается первым, так как зона локализована и риск низкий.
 > Ветка: `feat/rpc-batch-migration`.
 
-## Цель
+## TL;DR
 
-Убрать SELECT'ы из main-потока в списке чатов, заменив поштучную нативную загрузку
-(`getChat` + `getSummary` + `getFreshMsgCount`) одним батчевым RPC-вызовом в фоне.
+В списке чатов каждая видимая строка грузится на main-потоке несколькими нативными
+вызовами (`getChat` + `getSummary` + `getFreshMsgCount`), каждый из которых делает SELECT в
+SQLite — итого 3–5 SELECT на строку. План: заменить поштучную загрузку на один батчевый
+JSON-RPC вызов `getChatlistItemsByEntries`, который возвращает готовые объекты `ChatListItem`
+пачкой, и грузить их в фоне. Main-поток перестаёт блокироваться.
+
+## Контекст
+
+`DcChatlist`, `DcChat`, `DcLot` — нативные обёртки: Java-классы с `long`-указателем на
+Rust-объект в куче. `DcChatlist` хранит только список id (загруженных одним SELECT), а
+данные строки (`getSummary`) грузятся по одной и без кеша. Альтернатива — батчевый
+JSON-RPC, отдающий плоские DTO. Термины (FFI, DTO, CPtr, main-поток, ANR) раскрыты в
+роадмапе.
 
 ## Текущее состояние (факты из кода)
 
@@ -28,7 +40,7 @@ DcHelper.getThreadRecord(context, summary, chat)              // → getFreshMsg
 ```
 
 Итого **3–5 SELECT на строку на main**. Плюс `getItemViewType(i)` тоже читает
-`dcChatlist.getChatId(i)` (0 SQL, из памяти — не страшно).
+`dcChatlist.getChatId(i)` (0 SQL, из памяти — не критично).
 
 ## Зависимости от нативных указателей (что надо убрать)
 
@@ -46,7 +58,7 @@ DcHelper.getThreadRecord(context, summary, chat)              // → getFreshMsg
 `DirectShareUtil` (direct share). Это **вторичные** потребители — их трогаем вторым заходом,
 первый шаг ограничиваем рендером списка чатов.
 
-## DTO `ChatListItem` — полное покрытие (проверено)
+## DTO `ChatListItem` — полное покрытие
 
 Рендер читает поля, и все они есть в `ChatListItemFetchResult.ChatListItem`:
 
@@ -88,8 +100,8 @@ getChatlistItemsByEntries(accountId, List<Integer> entries) → Map<String, Chat
 **Уровень клиента (что делаем сейчас):** 3–5 SELECT на строку на main → **один RPC-вызов**
 на окно в фоне. Main перестаёт блокироваться полностью. Это главный выигрыш (jank/ANR).
 
-**Уровень SQL (п.3 роадмапа, НЕ сейчас):** внутри ядра `get_chatlist_items_by_entries`
-(`api.rs:787`) — это цикл:
+**Уровень SQL (направление 3 глобального плана, НЕ сейчас):** внутри ядра
+`get_chatlist_items_by_entries` (`api.rs:787`) — это цикл:
 
 ```rust
 for &entry in entries.iter() {
@@ -121,20 +133,20 @@ for &entry in entries.iter() {
 4. **Обновления по событиям.** Список реагирует на ~12 событий (`MSGS_CHANGED`,
    `INCOMING_MSG`, `MSG_READ`, …) через `loadChatlistAsync()`. Перезагрузка батча должна
    остаться debounced-фоновой, как сейчас.
-5. **`isSendingLocation` / `freshness`** — это вычисляемые поля; в DTO уже готовы, legacy
-   `chat.isSendingLocations()` — 0 SQL (поле), `getFreshMsgCount` — SELECT. DTO снимает SELECT.
+5. **`isSendingLocation` / `freshness`** — вычисляемые поля; в DTO уже готовы. Legacy
+   `chat.isSendingLocations()` — 0 SQL (поле), `getFreshMsgCount` — SELECT; DTO снимает SELECT.
 
 ## План по файлам (первый шаг — только рендер списка)
 
 1. `ConversationListAdapter.java`
-   - `DcChatlist dcChatlist` → `List<ChatListItemFetchResult> items` (или кеш по id).
+   - `DcChatlist dcChatlist` → `List<ChatListItemFetchResult> items` (или кеш по id);
    - `getItemCount` → `items.size()`; `getItemId` → `item.id`; `getItemViewType` → `item.id`
-     (спец. id) / `kind`.
-   - `onBindViewHolder` → читать DTO, передавать в `bind(...)` вместо `ThreadRecord`+`DcLot`.
+     (спец. id) / `kind`;
+   - `onBindViewHolder` → читать DTO, передавать в `bind(...)` вместо `ThreadRecord`+`DcLot`;
    - `changeData(DcChatlist)` → `changeData(List<ChatListItemFetchResult>)`.
 2. `ConversationListFragment.java`
    - `loadChatlist()`: вместо `getChatlist(...)` → `getChatlistEntries(...)` → id,
-     затем `getChatlistItemsByEntries(ids)` в фоне → `changeData(items)` на main.
+     затем `getChatlistItemsByEntries(ids)` в фоне → `changeData(items)` на main;
    - сохранить debounce (`loadChatlistAsync`) и обработку событий как есть.
 3. `ConversationListItem.java`
    - `bind(...)` принимать DTO (или облегчённый `ThreadRecord`, собранный из DTO);
@@ -151,7 +163,7 @@ for &entry in entries.iter() {
 - Поиск (`SearchViewModel`/`SearchResult`/`SearchListAdapter`) и shared-chats (`ProfileAdapter`)
   и `DirectShareUtil` — оставляем на `DcChatlist`, переносим вторым заходом (зона локализована
   и не на горячем пути списка).
-- Оптимизацию SQL в ядре (batch-SELECT) — это п.3 роадмапа, отдельный форк `chatmail/core`.
+- Оптимизацию SQL в ядре (batch-SELECT) — это направление 3 роадмапа, отдельный форк `chatmail/core`.
 
 ## Ограничение среды
 

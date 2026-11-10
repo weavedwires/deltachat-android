@@ -1,12 +1,25 @@
 # Перевод рендера списка сообщений с `DcMsg` на батчевый RPC (DTO)
 
-> Статус: план, этап 1 из глобального `rpc-batch-roadmap.md`.
+> Часть глобального плана — см. `rpc-batch-roadmap.md` (там архитектура, термины, порядок).
 > Ветка: `feat/rpc-batch-migration`.
 
-## Цель
+## TL;DR
 
-Убрать блокировку main-потока при прокрутке чата, не трогая при этом virtual-list
-и не переписывая логику действий с сообщениями.
+В открытом чате каждая видимая строка сейчас грузится отдельным нативным вызовом
+`dcContext.getMsg(id)`, который под капотом делает SELECT в SQLite, — и всё это на
+main-потоке. План: оставить virtual list (список id), но рендерить строки из плоского DTO,
+заполняемого батчем `getMessages(ids)` в фоне. Действия с сообщениями (удалить/прочитать/
+реакция) уже идут по id и не трогаются; нативные объекты `DcMsg` остаются только в
+композере (создание/отправка).
+
+## Контекст
+
+Объект `DcMsg` — это нативная обёртка: Java-класс с `long`-указателем на Rust-структуру в
+куче. Его методы-геттеры (`getText`, `getTimestamp`, `getType`, …) читают поля из памяти
+(0 SQL), но сам объект создаётся вызовом `dc_get_msg` → `Message::load_from_db`, который
+делает **один SELECT** на сообщение. Альтернатива — батчевый JSON-RPC: `getMessages(ids)`
+возвращает готовые плоские объекты `MessageLoadResult` пачкой. Термины (FFI, DTO, virtual
+list, main-поток, ANR) раскрыты в роадмапе.
 
 ## Проблема (факты из кода)
 
@@ -32,8 +45,8 @@ int[] msgs = dcContext.getChatMsgs((int) chatId, 0, 0);   // 1 SELECT → мас
 
 ## Решение
 
-Оставить virtual list (список id от `getChatMsgs`), но рендер перевести на плоский
-DTO, заполняемый **батчем**:
+Оставить virtual list (список id от `getChatMsgs`), но рендер перевести на плоский DTO,
+заполняемый **батчем**:
 
 1. `getChatMsgs` → `int[] msgs` (id) — не меняем.
 2. Вместо `recordCache` (SoftReference<DcMsg>) — кеш DTO `Map<Integer, MessageLoadResult>`.
@@ -46,7 +59,7 @@ DTO, заполняемый **батчем**:
 - `getMessageIds(accountId, chatId, infoOnly, addDaymarker)` → `List<Integer>` (`:945`)
 - `getMessages(accountId, List<Integer> ids)` → `Map<String, MessageLoadResult>` (`:1005`)
 
-## Покрытие DTO — проверено
+## Покрытие DTO
 
 `ConversationItem` (обычные сообщения) читает из `DcMsg` 12 методов:
 `getType, isOutgoing, getText, getId, getFromId, isForwarded, hasHtml, getQuotedText,
@@ -57,13 +70,13 @@ getOverrideSenderName, getOriginalMsgId, getDownloadState, getChatId`.
 originalMsgId, downloadState, chatId`.
 
 Цитата — DTO даже выгоднее: `MessageQuote` уже несёт `text`, `authorDisplayName`,
-`authorDisplayColor`, `image`, `viewType`, `messageId` — то, ради чего legacy FFI делал
+`authorDisplayColor`, `image`, `viewType`, `messageId` — то, ради чего прямой FFI делал
 ленивый `getQuotedMsg()` (отдельный SELECT). В DTO цитата лежит внутри ответа.
 
 ## Граница «рендер / действия / композер»
 
-Проверено по коду: `DcMsg` как объект действия встречается **только** в композере,
-над свежесозданным `new DcMsg(context, viewtype)`:
+По коду `DcMsg` как объект действия встречается **только** в композере, над свежесозданным
+`new DcMsg(context, viewtype)`:
 
 - `SendRelayedMessageUtil.createMessage()` — `setText`, `setFileAndDeduplicate` → `sendMsg`.
 - `ConversationActivity` — `setQuote`, `setDraft`, `sendMsg`.
@@ -80,16 +93,15 @@ originalMsgId, downloadState, chatId`.
 (`DcMsg.setQuote` = `setQuoteCPtr(quote.msgCPtr)`). Заменяется на `quotedMessageId`
 (RPC уже принимает: `miscSendMsg(…quotedMessageId)`, `sendMsg(MessageData)`).
 
-**Вывод:** рендер = DTO, действия = id, композер = DcMsg. Потоки не пересекаются
-нигде, кроме reply (закрывается `quotedMessageId`).
+**Вывод:** рендер = DTO, действия = id, композер = DcMsg. Потоки не пересекаются нигде,
+кроме reply (закрывается `quotedMessageId`).
 
 ## Что даёт / что не даёт
 
 - **Даёт:** убирает N блокировок main (jank/ANR от `getMsg` в `getItemViewType`/`bind`),
   N round-trip'ов JNI и N JSON-сериализаций.
-- **Не даёт (пока):** меньше SQL — ядро `get_messages` внутри цикл
-  (`for id { load_from_db }`), а не `WHERE id IN (...)`. Это этап «БД в ядре»
-  из глобального плана.
+- **Не даёт (пока):** меньше SQL — ядро `get_messages` внутри цикл (`for id { load_from_db }`),
+  а не `WHERE id IN (…)`. Это направление 3 глобального плана.
 
 ## План по файлам
 
@@ -99,7 +111,7 @@ originalMsgId, downloadState, chatId`.
    - `onBindViewHolder` читать DTO; передавать в `bind(...)` DTO вместо `DcMsg`;
    - prefetch окна через `getMessages(ids)` в `Util.runOnBackground`.
 2. `BindableConversationItem` / `BaseConversationItem` / `ConversationItem` / `ConversationUpdateItem`
-   - `bind(...)` принимает DTO (`MessageLoadResult.Message`) и читает поля из него.
+   - `bind(...)` принимает DTO (`MessageLoadResult.Message`) и читает поля из него;
    - `ConversationUpdateItem` проверить отдельно: `getParent()`/`getQuotedMsg()` (в DTO только `parentId`, не текст).
 3. `ConversationFragment.java`
    - действия (reply/forward/delete/download) оставить на `getMsg(id)`;
